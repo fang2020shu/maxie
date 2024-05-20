@@ -25,7 +25,7 @@ from maxie.utils.seed           import set_seed
 from maxie.utils.misc           import is_action_due
 from maxie.lr_scheduler         import CosineLRScheduler
 from maxie.perf                 import Timer
-from maxie.tensor_transforms    import Pad, DownscaleLocalMean, RandomPatch, RandomRotate, RandomShift, Patchify, Norm
+from maxie.tensor_transforms    import Pad, DownscaleLocalMean, RandomPatch, RandomRotate, RandomShift, Patchify
 from maxie.utils_fsdp           import (
     MemoryMaximizer,
     verify_bfloat_support,
@@ -125,7 +125,6 @@ H_pad             = transforms_config.get("H_pad")
 W_pad             = transforms_config.get("W_pad")
 patch_size        = transforms_config.get("patch_size")
 stride            = transforms_config.get("stride")
-#detector_norm_params = transforms_config.get("norm") # 5/10 added
 
 # -- Model
 model_params = config.get("model")
@@ -166,7 +165,6 @@ max_epochs           = misc_config.get("max_epochs")
 max_eval_iter        = misc_config.get("max_eval_iter")
 num_gpus             = misc_config.get("num_gpus")
 compiles_model       = misc_config.get("compiles_model")
-data_dump_on         = misc_config.get("data_dump_on", False)
 
 # ----------------------------------------------------------------------- #
 #  MISC FEATURES
@@ -291,11 +289,6 @@ set_seed(world_seed)
 
 # -- Set up transformation
 transforms = (
-<<<<<<< HEAD
-    #Norm(detector_norm_params), # 5/10 added
-=======
-    Norm(detector_norm_params),
->>>>>>> 7ba2e35874fbf29dd820c89191590d17f73745e8
     Pad(H_pad, W_pad),
     ## DownscaleLocalMean(factors = downscale_factors),
     ## RandomPatch(num_patch = num_patch, H_patch = size_patch, W_patch = size_patch, var_H_patch = var_size_patch, var_W_patch = var_size_patch, returns_mask = False),
@@ -486,7 +479,6 @@ def estimate_loss(dataloader, model, autocast_context, max_iter = None, desc = '
         DistributedSampler class, best with shuffle being true.  The shuffle
         takes place before batching.
     '''
-    # -- Setup
     dist_rank       = kwargs.get('dist_rank')
     dist_world_size = kwargs.get('dist_world_size')
 
@@ -496,7 +488,7 @@ def estimate_loss(dataloader, model, autocast_context, max_iter = None, desc = '
     # !!!!!!!!!!!!!!!
     # !! Data dump !!
     # !!!!!!!!!!!!!!!
-    if dist_rank == 0 and data_dump_on:
+    if dist_rank == 0:
         dir_data_dump = "data_dump"
         os.makedirs(dir_data_dump, exist_ok=True)
 
@@ -504,8 +496,7 @@ def estimate_loss(dataloader, model, autocast_context, max_iter = None, desc = '
         epoch         = kwargs.get('epoch')
         micro_batch   = kwargs.get('micro_batch')
 
-    # -- Eval iterations
-    # Set default number of iterations
+
     if max_iter is None:
         max_iter = len(dataloader)
 
@@ -536,7 +527,7 @@ def estimate_loss(dataloader, model, autocast_context, max_iter = None, desc = '
         # !!!!!!!!!!!!!!!
         # !! Data dump !!
         # !!!!!!!!!!!!!!!
-        if dist_rank == 0 and data_dump_on:
+        if dist_rank == 0:
             mini_batch = enum_idx
 
             data_dump = {
@@ -552,46 +543,43 @@ def estimate_loss(dataloader, model, autocast_context, max_iter = None, desc = '
         num_samples[enum_idx] = len(batch_input)
         proc_masks[enum_idx]   = 1
 
-    # -- Handle nan
     # Obtain the nan mask
     non_nan_mask = ~torch.isnan(losses)
 
     # Get the actual mask of values that are from the processing loop and non nan
     masks = torch.logical_and(proc_masks>0, non_nan_mask)
 
-    # -- Mean loss over eval iterations
-    local_valid_losses = losses[masks].to(torch.float32)
-    local_losses_mean  = local_valid_losses.mean()
+    # Calculate mean loss over all batches
+    valid_losses      = losses[masks].to(torch.float32)
+    valid_num_samples = num_samples[masks]
+    num_samples_sum   = valid_num_samples.sum()
+    avg_weights       = valid_num_samples / (num_samples_sum+1e-6)
+    losses_mean       = torch.dot(valid_losses, avg_weights)    # Even [] gives 0.0
+    losses_mean      /= dist_world_size    # Scaled it now to prevent nan from summing large values
 
-    # -- Mean loss over ranks
-    # Survey the occurence of nan across ranks
-    world_nan_counter = torch.tensor(0, dtype = torch.int, device = device)
-    local_nan_masks = torch.isnan(local_losses_mean)
-    if local_nan_masks.any().item():
+    world_losses_mean  = torch.zeros_like(losses_mean, dtype = torch.float32, device = device)
+    world_losses_mean += losses_mean.to(torch.float32)
+
+    world_nan_masks = torch.isnan(world_losses_mean)
+    if world_nan_masks.any().item():
         print(f"[RANK {dist_rank}] EVAL ERROR: NaN encountered!!!")
-        world_nan_counter += 1
-        local_losses_mean  = 0.0    # Contribute to nothing in the reduced sum
-    dist.all_reduce(world_nan_counter, op=dist.ReduceOp.SUM)
+        world_losses_mean[world_nan_masks] = 0.0    # Contribute to nothing in the reduced sum
 
-    # Scale the local loss for the final reduced sum
-    local_losses_mean /= (dist_world_size - world_nan_counter + 1e-6)
-
-    # Calculate reduced sum as the final mean loss
-    world_losses_mean  = torch.zeros_like(local_losses_mean, dtype = torch.float32, device = device)
-    world_losses_mean += local_losses_mean.to(torch.float32)
     dist.all_reduce(world_losses_mean, op=dist.ReduceOp.SUM)
+    dist.barrier()
 
     # !!!!!!!!!!!!!!!
     # !! Data dump !!
     # !!!!!!!!!!!!!!!
-    if dist_rank == 0 and data_dump_on:
+    if dist_rank == 0:
         data_dump = {
             "losses"            : losses,
             "proc_masks"        : proc_masks,
             "non_nan_mask"      : non_nan_mask,
             "masks"             : masks,
-            "local_valid_losses": local_valid_losses,
-            "local_losses_mean" : local_losses_mean,
+            "valid_losses"      : valid_losses,
+            "avg_weights"       : avg_weights,
+            "losses_mean"       : losses_mean,
             "world_losses_mean" : world_losses_mean,
         }
         path_data_dump = os.path.join(dir_data_dump, f'{fl_log_prefix}.epoch{epoch}_microb{micro_batch}.end.pt')
@@ -689,24 +677,11 @@ try:
                 grad_nosync_counter += 1
 
             # -- Eval and checkpointing
+            # Rank0 performs evaluation and decide if a sharded state dict should be saved
             if is_action_due(micro_batch, chkpt_saving_period):
-                # !!!!!!!!!!!!!!!
-                # !! Data dump !!
-                # !!!!!!!!!!!!!!!
-                data_dump_timestamp = {
-                    "dist_rank"       : dist_rank,
-                    "dist_world_size" : dist_world_size,
-                }
-                if data_dump_on:
-                    data_dump_timestamp.update({
-                        "fl_log_prefix"   : fl_log_prefix,
-                        "epoch"           : epoch,
-                        "micro_batch"     : micro_batch,
-                    })
-
                 print(f'[RANK {dist_rank}] Start evaluation...')
 
-                # -- Eval
+                # -- Eval (Rank 0 only)
                 validate_loss = 0.0
 
                 # --- Train
@@ -719,14 +694,22 @@ try:
                 sampler_eval = torch.utils.data.DistributedSampler(dataset_eval_train, shuffle=True)
                 dataloader_eval = torch.utils.data.DataLoader(dataset_eval_train, batch_size=batch_size, sampler = sampler_eval, num_workers = num_workers, shuffle = False, collate_fn=custom_collate)
 
-                # Shuffle the training example
-                sampler_eval.set_epoch(rand_start_idx)  # Any integer is fine
+                # !!!!!!!!!!!!!!!
+                # !! Data dump !!
+                # !!!!!!!!!!!!!!!
+                data_dump_timestamp = {
+                    "fl_log_prefix"   : fl_log_prefix,
+                    "epoch"           : epoch,
+                    "micro_batch"     : micro_batch,
+                    "dist_rank"       : dist_rank,
+                    "dist_world_size" : dist_world_size,
+                }
 
                 # Get loss
                 train_loss = estimate_loss(dataloader_eval, model, autocast_context, max_iter = max_eval_iter, desc = '(training set)', device = device, **data_dump_timestamp)
 
-                # Log the train loss
                 if dist_rank == 0:
+                    # Log the train loss
                     logger.info(f"[RANK {dist_rank}] LOSS:EVAL - epoch {epoch}, micro_batch {micro_batch}, mean train loss = {train_loss:.8f}")
 
                 # --- Validation
@@ -739,13 +722,10 @@ try:
                 sampler_eval = torch.utils.data.DistributedSampler(dataset_eval_val, shuffle=True)
                 dataloader_eval = torch.utils.data.DataLoader(dataset_eval_val, batch_size=batch_size, sampler = sampler_eval, num_workers = num_workers, shuffle = False, collate_fn=custom_collate)
 
-                # Shuffle the validation example
-                sampler_eval.set_epoch(rand_start_idx)  # Any integer is fine
-
                 validate_loss = estimate_loss(dataloader_eval, model, autocast_context, max_iter = max_eval_iter, desc = '(validation set)', device = device, **data_dump_timestamp)
 
-                # Log the validation loss
                 if dist_rank == 0:
+                    # Log the validation loss
                     logger.info(f"[RANK {dist_rank}] LOSS:EVAL - epoch {epoch}, micro_batch {micro_batch}, mean validation loss = {validate_loss:.8f}")
 
                 # -- Save checkpoint
@@ -758,6 +738,7 @@ try:
                     training_state.end_idx_prev   = dataset_train.end_idx
                     training_state.loss_min       = loss_min
 
+                    # Save a checkpoint
                     dir_chkpt = f"{timestamp}.epoch_{epoch}.end_idx_{dataset_train.end_idx}"
                     if dir_chkpt_prefix is not None: dir_chkpt = f"{dir_chkpt_prefix}.{dir_chkpt}"
                     path_chkpt = os.path.join(dir_root_chkpt, dir_chkpt)
