@@ -125,6 +125,7 @@ H_pad             = transforms_config.get("H_pad")
 W_pad             = transforms_config.get("W_pad")
 patch_size        = transforms_config.get("patch_size")
 stride            = transforms_config.get("stride")
+#detector_norm_params = transforms_config.get("norm") # 5/10 added
 
 # -- Model
 model_params = config.get("model")
@@ -289,6 +290,7 @@ set_seed(world_seed)
 
 # -- Set up transformation
 transforms = (
+    #Norm(detector_norm_params), # 5/10 added
     Pad(H_pad, W_pad),
     ## DownscaleLocalMean(factors = downscale_factors),
     ## RandomPatch(num_patch = num_patch, H_patch = size_patch, W_patch = size_patch, var_H_patch = var_size_patch, var_W_patch = var_size_patch, returns_mask = False),
