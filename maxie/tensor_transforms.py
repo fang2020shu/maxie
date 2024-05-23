@@ -226,6 +226,15 @@ class Patchify:
 
         return batch_patches
 
+class Norm:
+    def __init__(self, detector_norm_params):
+        self.detector_norm_params = detector_norm_params
+
+    def __call__(self, img, detector_name, **kwargs):
+        mean, std = self.detector_norm_params[detector_name]["mean"], self.detector_norm_params[detector_name]["std"]
+        C = img.shape[-3]
+        return normalize(img, [mean]*C, [std]*C)
+
 # class Norm: # added 5/10
 #     def __init__(self, detector_norm_params):
 #         self.detector_params = detector_norm_params
