@@ -138,6 +138,7 @@ detector_norm_params = transforms_config.get("norm")
 # -- Model
 model_params = config.get("model")
 model_name   = model_params.get("name")
+mask_ratio   = model_params.get("mask_ratio")
 
 # -- Loss
 loss_config      = config.get("loss")
@@ -351,7 +352,10 @@ def custom_collate(batch):
 # ----------------------------------------------------------------------- #
 logger.debug(f'[RANK {dist_rank}] Configuring model...')
 # -- Config the model
-model_config = AdaptedViTMAEForPreTrainingConfig(model_name = model_name)
+model_config = AdaptedViTMAEForPreTrainingConfig(
+    model_name = model_name,
+    mask_ratio = mask_ratio,
+)
 model = AdaptedViTMAEForPreTraining(model_config)
 if not uses_dist: model.to(device)
 
@@ -868,11 +872,12 @@ try:
                 if fl_chkpt_prefix is not None: dir_chkpt = f"{fl_chkpt_prefix}.{dir_chkpt}"
                 path_chkpt = os.path.join(dir_root_chkpt, dir_chkpt)
                 checkpointer.save(model, optimizer, scheduler, training_state, path_chkpt)
-                logger.info(f"Saving preemptive checkpoint (epoch {epoch}, end_idx {dataset_train.end_idx}) at {path_chkpt}.")
+                logger.info(f"[RANK {dist_rank}] Saving preemptive checkpoint (epoch {epoch}, end_idx {dataset_train.end_idx}) at {path_chkpt}.")
 
-                with open(preempt_metadata_path, "w") as f:
-                    f.write(path_chkpt)
-                logger.info(f"Saving preemptive metadata (epoch {epoch}, end_idx {dataset_train.end_idx}) at {preempt_metadata_path}.")
+                if dist_rank == 0:
+                    with open(preempt_metadata_path, "w") as f:
+                        f.write(path_chkpt)
+                    logger.info(f"[RANK {dist_rank}] Saving preemptive metadata (epoch {epoch}, end_idx {dataset_train.end_idx}) at {preempt_metadata_path}.")
 
             # [PERFORMANCE]
             if dist_local_rank == 0:
